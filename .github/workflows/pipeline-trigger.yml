@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Trigger pipeline
         env:
-          URL: ${{ vars.PIPELINE_URL }}
+          URL: ${{ secrets.PIPELINE_URL }}
         run: |
           echo "🚀 Calling $URL ..."
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
