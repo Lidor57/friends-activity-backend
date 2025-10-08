@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs daily at 05:00 Israel time (23:30 UTC previous day)
     - cron: '30 23 * * *'
-  workflow_dispatch: {}  # allows manual trigger
+  workflow_dispatch: { }  # allows manual trigger
 
 jobs:
   call-endpoint:
@@ -13,11 +13,13 @@ jobs:
       - name: Trigger pipeline
         env:
           URL: ${{ secrets.PIPELINE_URL }}
+          TOKEN: ${{ secrets.PIPELINE_TOKEN }}
         run: |
           echo "🚀 Calling $URL ..."
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{}' \
+            -d '{"users":["barlavi1","UrielOfir","Lidor57"]}' \
             "$URL")
           BODY=$(echo "$RESPONSE" | head -n 1)
           CODE=$(echo "$RESPONSE" | tail -n 1)
