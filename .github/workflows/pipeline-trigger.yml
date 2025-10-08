@@ -1,0 +1,31 @@
+name: Daily API Trigger
+
+on:
+  schedule:
+    # Runs daily at 05:00 Israel time (23:30 UTC previous day)
+    - cron: '30 23 * * *'
+  workflow_dispatch: {}  # allows manual trigger
+
+jobs:
+  call-endpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger pipeline
+        env:
+          URL: ${{ vars.PIPELINE_URL }}
+        run: |
+          echo "🚀 Calling $URL ..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            "$URL")
+          BODY=$(echo "$RESPONSE" | head -n 1)
+          CODE=$(echo "$RESPONSE" | tail -n 1)
+          echo "Response code: $CODE"
+          echo "Response body:"
+          echo "$BODY"
+          if [ "$CODE" -ge 400 ]; then
+            echo "❌ Request failed with status $CODE"
+            exit 1
+          fi
+          echo "✅ Trigger successful!"
