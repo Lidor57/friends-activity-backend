@@ -1,6 +1,8 @@
 
 import { DataSource } from 'typeorm';
 
+export type RawPayload = Record<string, unknown>;
+
 export interface BronzeRow {
   event_ulid: string;
   provider: 'github';
@@ -12,7 +14,7 @@ export interface BronzeRow {
   created_at?: string | null; // ISO string
   received_at?: string | null; // you can ignore; DB defaults now()
   is_private?: boolean | null;
-  raw_payload: any;
+  raw_payload: RawPayload;
 }
 
 export async function insertBronze(ds: DataSource, row: BronzeRow) {
@@ -45,7 +47,8 @@ export interface BronzeUserRow {
   user_node: string;       // GitHub numeric id, as text
   login: string;
   name?: string | null;
-  raw_payload: any;
+  raw_payload: RawPayload;
+  last_synced_at?: string | null; // ISO string
 }
 
 /** Upsert latest user payload into bronze.github_users */
@@ -53,16 +56,35 @@ export async function upsertBronzeUser(ds: DataSource, row: BronzeUserRow) {
   await ds.query(
     `
     INSERT INTO bronze.github_users
-      (user_node, provider, login, name, fetched_at, raw_payload)
+      (user_node, provider, login, name, fetched_at, raw_payload, processing_status, last_synced_at)
     VALUES
-      ($1, 'github', $2, $3, now(), $4::jsonb)
+      ($1, 'github', $2, $3, now(), $4::jsonb, 'processing', $5)
     ON CONFLICT (user_node) DO UPDATE
       SET login = EXCLUDED.login,
           name  = EXCLUDED.name,
           fetched_at = now(),
-          raw_payload = EXCLUDED.raw_payload
+          raw_payload = EXCLUDED.raw_payload,
+          last_synced_at = EXCLUDED.last_synced_at
     `,
-    [row.user_node, row.login, row.name ?? null, JSON.stringify(row.raw_payload)]
+    [row.user_node, row.login, row.name ?? null, JSON.stringify(row.raw_payload), row.last_synced_at ?? null]
+  );
+}
+
+/** Insert user with specific processing status (for new users) */
+export async function insertBronzeUserWithStatus(
+  ds: DataSource, 
+  row: BronzeUserRow, 
+  status: 'ready' | 'processing' | 'failed' = 'ready'
+) {
+  await ds.query(
+    `
+    INSERT INTO bronze.github_users
+      (user_node, provider, login, name, fetched_at, raw_payload, processing_status, last_synced_at)
+    VALUES
+      ($1, 'github', $2, $3, now(), $4::jsonb, $5, $6)
+    ON CONFLICT (user_node) DO NOTHING
+    `,
+    [row.user_node, row.login, row.name ?? null, JSON.stringify(row.raw_payload), status, row.last_synced_at ?? null]
   );
 }
 
@@ -73,7 +95,7 @@ export interface BronzeRepoRow {
   owner_login?: string | null;
   name?: string | null;
   is_private?: boolean | null;
-  raw_payload: any;
+  raw_payload: RawPayload;
 }
 
 /** Upsert latest repo payload into bronze.github_repos */

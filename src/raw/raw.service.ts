@@ -3,13 +3,43 @@ import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { Octokit } from '@octokit/rest';
 import { paginateRest } from '@octokit/plugin-paginate-rest';
+import { RequestError } from '@octokit/request-error';
+import type { RestEndpointMethodTypes } from '@octokit/rest';
+import type { RequestParameters } from '@octokit/types';
 import { insertBronze, BronzeRow,  upsertBronzeUser, upsertBronzeRepo } from './raw-saver.js';
+import type { RawPayload } from './raw-saver.js';
 import { RawMemoryStore, BronzeEventsRow, BronzeUsersRow, BronzeReposRow } from './raw-memory.store.js';
 
 const MyOctokit = Octokit.plugin(paginateRest);
   
 const ISSUE_NUM_RE = /\/issues\/(\d+)$/;
 const PR_NUM_RE    = /\/pulls\/(\d+)$/;
+
+type RepoResponse = RestEndpointMethodTypes['repos']['get']['response']['data'];
+type UserResponse = RestEndpointMethodTypes['users']['getByUsername']['response']['data'];
+type IssueListItem = RestEndpointMethodTypes['issues']['listForRepo']['response']['data'][number];
+type IssueListParams = RestEndpointMethodTypes['issues']['listForRepo']['parameters'];
+type IssueDetailResponse = RestEndpointMethodTypes['issues']['get']['response']['data'];
+type PullDetailResponse = RestEndpointMethodTypes['pulls']['get']['response']['data'];
+
+type IssueCommentItem = RestEndpointMethodTypes['issues']['listCommentsForRepo']['response']['data'][number];
+type IssueCommentParams = RestEndpointMethodTypes['issues']['listCommentsForRepo']['parameters'];
+type ReviewCommentItem = RestEndpointMethodTypes['pulls']['listReviewCommentsForRepo']['response']['data'][number];
+type ReviewCommentParams = RestEndpointMethodTypes['pulls']['listReviewCommentsForRepo']['parameters'];
+
+type PullCommitItem = RestEndpointMethodTypes['pulls']['listCommits']['response']['data'][number];
+type PullCommitParams = RestEndpointMethodTypes['pulls']['listCommits']['parameters'];
+type RepoCommitItem = RestEndpointMethodTypes['repos']['listCommits']['response']['data'][number];
+type RepoCommitParams = RestEndpointMethodTypes['repos']['listCommits']['parameters'];
+
+type SearchIssueItem = RestEndpointMethodTypes['search']['issuesAndPullRequests']['response']['data']['items'][number];
+type SearchIssueParams = RestEndpointMethodTypes['search']['issuesAndPullRequests']['parameters'];
+type SearchCommitItem = RestEndpointMethodTypes['search']['commits']['response']['data']['items'][number];
+type SearchCommitParams = RestEndpointMethodTypes['search']['commits']['parameters'];
+
+type GoldUserProfileRow = { login: string };
+type BronzeUserNodeRow = { login: string; user_node: string | null };
+type BronzeUserNodeOnlyRow = { user_node: string | null };
 
 @Injectable()
 export class GithubService {
@@ -25,6 +55,20 @@ export class GithubService {
     @Inject(RawMemoryStore) private readonly mem: RawMemoryStore,
   ) {}
 
+  private isRequestError(error: unknown): error is RequestError {
+    return error instanceof RequestError;
+  }
+
+  private getErrorStatus(error: unknown): number | undefined {
+    return this.isRequestError(error) ? error.status : undefined;
+  }
+
+  private getErrorMessage(error: unknown): string {
+    if (this.isRequestError(error)) return error.message;
+    if (error instanceof Error) return error.message;
+    return String(error);
+  }
+
   private async sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -35,22 +79,24 @@ export class GithubService {
     maxRetries = 5,
     baseDelay = 2000
   ): Promise<T> {
-    let lastError: any;
+    let lastError: unknown;
     
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         return await fn();
-      } catch (error: any) {
+      } catch (error: unknown) {
         lastError = error;
-        const isRateLimit = error?.status === 403 && error?.message?.includes('rate limit');
-        const isServerError = error?.status >= 500; // 502, 504, etc.
+        const status = this.getErrorStatus(error);
+        const message = this.getErrorMessage(error);
+        const isRateLimit = status === 403 && message.includes('rate limit');
+        const isServerError = typeof status === 'number' && status >= 500; // 502, 504, etc.
         
         if (attempt === maxRetries) {
           if (isServerError) {
-            this.logger.warn(`⚠️ ${operation} failed with server error after ${maxRetries} attempts, skipping: ${error?.status}`);
-            return [] as any; // Return empty array for pagination failures
+            this.logger.warn(`⚠️ ${operation} failed with server error after ${maxRetries} attempts, skipping: ${status ?? 'unknown'}`);
+            return [] as T; // Return empty array for pagination failures
           }
-          this.logger.warn(`❌ ${operation} failed after ${maxRetries} attempts: ${error?.message}`);
+          this.logger.warn(`❌ ${operation} failed after ${maxRetries} attempts: ${message}`);
           throw error;
         }
         
@@ -65,7 +111,7 @@ export class GithubService {
       }
     }
     
-    throw lastError;
+    throw (lastError instanceof Error ? lastError : new Error(this.getErrorMessage(lastError)));
   }
 
   // --------- Helpers ----------
@@ -117,13 +163,15 @@ export class GithubService {
   private async fetchRepoMeta(owner: string, repo: string) {
     this.logger.log(`Fetching repo metadata: ${owner}/${repo}`);
     const { data } = await this.octokit.repos.get({ owner, repo });
+    const repoData: RepoResponse = data;
     this.logger.log(`✅ Repo metadata fetched: ${owner}/${repo}`);
     
-    const repo_node = String((data as any).id);
-    const full_name = (data as any).full_name ?? `${owner}/${repo}`;
-    const owner_login = (data as any).owner?.login ?? owner;
-    const name = (data as any).name ?? repo;
-    const is_private = Boolean((data as any).private);
+    const repo_node = String(repoData.id);
+    const full_name = repoData.full_name ?? `${owner}/${repo}`;
+    const owner_login = repoData.owner?.login ?? owner;
+    const name = repoData.name ?? repo;
+    const is_private = repoData.private === true;
+    const rawPayload = repoData as RawPayload;
     
     try {
       // DB write
@@ -133,7 +181,7 @@ export class GithubService {
         owner_login,
         name,
         is_private,
-        raw_payload: data,
+        raw_payload: rawPayload,
       });
       
       // Memory write
@@ -145,7 +193,7 @@ export class GithubService {
         name,
         is_private,
         fetched_at: null,
-        raw_payload: data,
+        raw_payload: rawPayload,
       };
       this.mem.upsertRepo(memRepo);
     } catch (error) {
@@ -155,7 +203,7 @@ export class GithubService {
     return {
       owner,
       name: repo,
-      id: Number((data as any).id),
+      id: Number(repoData.id),
       private: is_private,
     };
   }
@@ -204,14 +252,14 @@ export class GithubService {
     const result = await this.ds.query(
       'SELECT login FROM gold.user_profile WHERE login = ANY($1)',
       [userLogins]
-    );
+    ) as GoldUserProfileRow[];
     
-    return new Set(result.map((row: any) => row.login));
+    return new Set(result.map((row) => row.login));
   }
 
   private async getAllDbUsers(): Promise<string[]> {
-    const result = await this.ds.query('SELECT login FROM gold.user_profile');
-    return result.map((row: any) => row.login);
+    const result = await this.ds.query('SELECT login FROM gold.user_profile') as GoldUserProfileRow[];
+    return result.map((row) => row.login);
   }
 
   private findExcludedUsers(allDbUsers: string[], inputUsers: string[]): string[] {
@@ -227,9 +275,9 @@ export class GithubService {
     const userNodes = await this.ds.query(
       'SELECT login, user_node FROM bronze.github_users WHERE login = ANY($1)',
       [usersToRemove]
-    );
-    const userNodeMap = new Map(userNodes.map((row: any) => [row.login, row.user_node]));
-    const userNodeValues = Array.from(userNodeMap.values()).filter(Boolean);
+    ) as BronzeUserNodeRow[];
+    const userNodeMap = new Map(userNodes.map((row) => [row.login, row.user_node]));
+    const userNodeValues = Array.from(userNodeMap.values()).filter((node): node is string => typeof node === 'string');
 
     let eventsDeleted = 0;
     let activitiesDeleted = 0;
@@ -293,7 +341,7 @@ export class GithubService {
         const userNodeResult = await this.ds.query(
           'SELECT user_node FROM bronze.github_users WHERE login = $1',
           [user]
-        );
+        ) as BronzeUserNodeOnlyRow[];
         
         if (userNodeResult.length === 0) {
           this.logger.warn(`⚠️ User ${user} not found in bronze.github_users, skipping`);
@@ -301,6 +349,10 @@ export class GithubService {
         }
         
         const userNode = userNodeResult[0].user_node;
+        if (!userNode) {
+          this.logger.warn(`⚠️ User ${user} has no user_node in bronze.github_users, skipping`);
+          continue;
+        }
         
         // Delete events for this user
         await this.ds.query(
@@ -358,8 +410,8 @@ export class GithubService {
     if (!inputUsers.length) return;
 
     // Get all users currently in gold.user_profile
-    const allDbUsers = await this.ds.query('SELECT login FROM gold.user_profile');
-    const dbUserLogins = allDbUsers.map((row: any) => row.login);
+    const allDbUsers = await this.ds.query('SELECT login FROM gold.user_profile') as GoldUserProfileRow[];
+    const dbUserLogins = allDbUsers.map((row) => row.login);
     
     // Find users in DB but not in input list
     const usersToRemove = dbUserLogins.filter((login: string) => !inputUsers.includes(login));
@@ -372,6 +424,66 @@ export class GithubService {
     await this.removeSpecificUsers(usersToRemove);
   }
 
+  private async getUserSyncDates(users: string[]): Promise<Map<string, string>> {
+    const userSyncDates = new Map<string, string>();
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    
+    // Get user sync info from bronze.github_users
+    const result = await this.ds.query(
+      'SELECT login, user_node, last_synced_at FROM bronze.github_users WHERE login = ANY($1)',
+      [users]
+    );
+    
+    for (const row of result) {
+      const login = row.login;
+      
+      if (row.last_synced_at) {
+        // Use last_synced_at - 1 day
+        const lastSync = new Date(row.last_synced_at);
+        const oneDayBefore = new Date(lastSync.getTime() - oneDayMs);
+        userSyncDates.set(login, oneDayBefore.toISOString().replace(/\.\d{3}Z$/, 'Z'));
+        this.logger.log(`📅 User ${login}: syncing from last_synced_at - 1 day (${oneDayBefore.toISOString()})`);
+      } else {
+        // Get latest activity date from bronze.github_events
+        const latestActivity = await this.ds.query(
+          'SELECT MAX(created_at) as latest FROM bronze.github_events WHERE actor_user_node = $1',
+          [row.user_node]
+        );
+        
+        if (latestActivity[0]?.latest) {
+          // Apply 1-day overlap to latest activity too
+          const fromTs = new Date(new Date(latestActivity[0].latest).getTime() - oneDayMs)
+            .toISOString().replace(/\.\d{3}Z$/, 'Z');
+          userSyncDates.set(login, fromTs);
+          this.logger.log(`📅 User ${login}: syncing from latest activity - 1 day overlap (${fromTs})`);
+        } else {
+          // Fallback to 2 days ago if no activity found
+          const twoDaysAgo = this.isoHoursAgo(48);
+          userSyncDates.set(login, twoDaysAgo);
+          this.logger.log(`📅 User ${login}: no activity found, using 2 days ago (${twoDaysAgo})`);
+        }
+      }
+    }
+    
+    return userSyncDates;
+  }
+
+  private async updateUserSyncTimestamp(users: string[], ts?: string) {
+    const stamp = ts ?? this.isoNow();
+    for (const login of users) {
+      try {
+        // Use GREATEST to prevent out-of-order updates from concurrent runs
+        await this.ds.query(
+          'UPDATE bronze.github_users SET last_synced_at = GREATEST(COALESCE(last_synced_at, \'-infinity\'), $1::timestamptz) WHERE login = $2',
+          [stamp, login]
+        );
+        this.logger.log(`✅ Updated last_synced_at for user ${login}`);
+      } catch (error) {
+        this.logger.warn(`❌ Failed to update last_synced_at for user ${login}: ${error}`);
+      }
+    }
+  }
+
   private async upsertUserProfilesToBronze(logins: string[]) {
     const unique = Array.from(new Set(logins.map(s => s.trim()).filter(Boolean)));
     this.logger.log(`Fetching user profiles: ${unique.join(', ')}`);
@@ -379,16 +491,18 @@ export class GithubService {
       try {
         this.logger.log(`Fetching user: ${login}`);
         const { data } = await this.octokit.users.getByUsername({ username: login });
-        const user_node = String((data as any).id);
-        const userLogin = (data as any).login ?? login;
-        const name = (data as any).name ?? null;
+        const userData: UserResponse = data;
+        const user_node = String(userData.id);
+        const userLogin = userData.login ?? login;
+        const name = userData.name ?? null;
+        const rawPayload = userData as RawPayload;
         
         // DB write
         await upsertBronzeUser(this.ds, {
           user_node,
           login: userLogin,
           name,
-          raw_payload: data,
+          raw_payload: rawPayload,
         });
         
         // Memory write
@@ -398,7 +512,7 @@ export class GithubService {
           login: userLogin,
           name,
           fetched_at: null,
-          raw_payload: data,
+          raw_payload: rawPayload,
         };
         this.mem.upsertUser(memUser);
         this.logger.log(`✅ User profile saved: ${login}`);
@@ -415,19 +529,19 @@ export class GithubService {
     const map = new Map<string, string>();
     const items = await this.octokit.paginate(
       this.octokit.issues.listForRepo,
-      { owner, repo, state: 'all', per_page: 100, since: sinceIso },
-      (r) => r.data,
+      { owner, repo, state: 'all', per_page: 100, since: sinceIso } satisfies IssueListParams,
+      (r) => r.data as IssueListItem[],
     );
     for (const it of items) {
-      const num = (it as any).number;
-      const id  = (it as any).id;
+      const num = it.number;
+      const id  = it.id;
       if (num != null && id != null) map.set(String(num), String(id));
     }
     return map;
   }
 
   private async resolveIssueParentId(
-    owner: string, repo: string, comment: any, numberToId: Map<string, string>
+    owner: string, repo: string, comment: IssueCommentItem, numberToId: Map<string, string>
   ) {
     const issueUrl = comment.issue_url ?? '';
     const m = issueUrl.match(ISSUE_NUM_RE);
@@ -438,7 +552,8 @@ export class GithubService {
 
     try {
       const { data } = await this.octokit.issues.get({ owner, repo, issue_number: Number(num) });
-      const id = String((data as any).id);
+      const issue: IssueDetailResponse = data;
+      const id = String(issue.id);
       numberToId.set(num, id);
       return id;
     } catch (error) {
@@ -448,7 +563,7 @@ export class GithubService {
   }
 
   private async resolvePRParentId(
-    owner: string, repo: string, comment: any, numberToId: Map<string, string>
+    owner: string, repo: string, comment: ReviewCommentItem, numberToId: Map<string, string>
   ) {
     const prUrl = comment.pull_request_url ?? '';
     const m = prUrl.match(PR_NUM_RE);
@@ -459,7 +574,8 @@ export class GithubService {
 
     try {
       const { data } = await this.octokit.pulls.get({ owner, repo, pull_number: Number(num) });
-      const id = String((data as any).id);
+      const pr: PullDetailResponse = data;
+      const id = String(pr.id);
       numberToId.set(num, id);
       return id;
     } catch (error) {
@@ -480,27 +596,27 @@ export class GithubService {
     const commits = await this.retryWithBackoff(
       () => this.octokit.paginate(
         this.octokit.pulls.listCommits,
-        { owner, repo, pull_number: prNumber, per_page: 100 },
-        r => r.data,
+        { owner, repo, pull_number: prNumber, per_page: 100 } satisfies PullCommitParams,
+        (r) => r.data as PullCommitItem[],
       ),
       `PR commits for ${owner}/${repo}#${prNumber}`
     );
 
     for (const c of commits) {
-      const authorLogin = (c as any).author?.login;
+      const authorLogin = c.author?.login ?? null;
       if (users.size && (!authorLogin || !users.has(authorLogin))) continue;
       
       const row: BronzeRow = {
-        event_ulid: `commit:${(c as any).sha}`,
+        event_ulid: `commit:${String(c.sha)}`,
         provider: 'github',
         event_type: 'commit',
-        provider_event_id: String((c as any).sha),
-        actor_user_node: (c as any).author?.id ? String((c as any).author.id) : null,
+        provider_event_id: String(c.sha),
+        actor_user_node: c.author?.id != null ? String(c.author.id) : null,
         repo_node: repoId != null ? String(repoId) : null,
         target_node: prId,
-        created_at: (c as any).commit?.committer?.date ?? null,
+        created_at: c.commit?.committer?.date ?? null,
         is_private: isPrivate ?? null,
-        raw_payload: c,
+        raw_payload: c as RawPayload,
       };
       await this.writeEventBoth(row);
     }
@@ -522,13 +638,14 @@ export class GithubService {
     const issues = await this.retryWithBackoff(
       () => this.octokit.paginate(
         this.octokit.search.issuesAndPullRequests,
-        { q: qIssues, per_page: 100, advanced_search: 'true'}
+        { q: qIssues, per_page: 100, advanced_search: 'true' } as SearchIssueParams & RequestParameters,
+        (r) => (r.data as unknown as { items: SearchIssueItem[] }).items,
       ),
       `Issues/PRs search for ${login}`
     );
     this.logger.log(`✅ Found ${issues.length} issues/PRs for ${login}`);
 
-    for (const it of issues as any[]) {
+    for (const it of issues) {
       const parsed = this.parseOwnerRepoFromRepoUrl(it.repository_url);
       if (parsed) found.set(this.repoKey(parsed.owner, parsed.repo), parsed);
     }
@@ -546,8 +663,9 @@ export class GithubService {
         {
           q: qCommits,
           per_page: 100,
-          headers: { accept: 'application/vnd.github.cloak-preview+json' },
-        } as any
+          request: { headers: { accept: 'application/vnd.github.cloak-preview+json' } },
+        } as SearchCommitParams & RequestParameters,
+        (r) => (r.data as unknown as { items: SearchCommitItem[] }).items,
       ),
       `Commits search for ${login}`,
       5,
@@ -555,8 +673,8 @@ export class GithubService {
     );
     this.logger.log(`✅ Found ${commits.length} commits for ${login}`);
 
-    for (const c of commits as any[]) {
-      const full = c.repository?.full_name as string | undefined;
+    for (const c of commits) {
+      const full = c.repository?.full_name ?? undefined;
       if (full && full.includes('/')) {
         const [owner, repo] = full.split('/');
         found.set(this.repoKey(owner, repo), { owner, repo });
@@ -610,43 +728,50 @@ export class GithubService {
 
     for (const login of logins) {
       try {
+        const listParams: IssueListParams = {
+          owner,
+          repo,
+          state: 'all',
+          per_page: 100,
+          since: sinceIso,
+        };
+        if (login) listParams.creator = login;
+
         const pages = await this.retryWithBackoff(
           () => this.octokit.paginate(
             this.octokit.issues.listForRepo,
-            { owner, repo, state: 'all', per_page: 100, since: sinceIso, ...(login ? { creator: login } : {}) } as any,
-            (r) => r.data,
+            listParams,
+            (r) => r.data as IssueListItem[],
           ),
           `Issues/PRs for ${owner}/${repo} ${login ? `(creator: ${login})` : ''}`
         );
 
         for (const it of pages) {
-          const isPR = (it as any).pull_request != null;
+          const isPR = it.pull_request != null;
           const event_type = isPR ? 'pull_request' : 'issue';
 
-          // For PRs, augment payload with repo info for commit fetching
-          const payload = isPR ? {
-            ...it,
-            _repo_owner: owner,
-            _repo_name: repo,
-          } : it;
+          const basePayload = it as unknown as RawPayload;
+          const payload = isPR
+            ? { ...basePayload, _repo_owner: owner, _repo_name: repo } as RawPayload
+            : basePayload;
 
           const row: BronzeRow = {
-            event_ulid: `${event_type}:${(it as any).id}`,
+            event_ulid: `${event_type}:${String(it.id)}`,
             provider: 'github',
             event_type,
-            provider_event_id: String((it as any).id),
-            actor_user_node: (it as any).user?.id ? String((it as any).user.id) : null,
+            provider_event_id: String(it.id),
+            actor_user_node: it.user?.id != null ? String(it.user.id) : null,
             repo_node: repoId != null ? String(repoId) : null,
-            target_node: String((it as any).id), // parent for itself
-            created_at: (it as any).created_at ?? null,
+            target_node: String(it.id), // parent for itself
+            created_at: it.created_at ?? null,
             is_private: isPrivate ?? null,
             raw_payload: payload,
           };
           rows.push(row);
           
           if (isPR) {
-            const prNumber = (it as any).number;
-            const prId = String((it as any).id);
+            const prNumber = it.number;
+            const prId = String(it.id);
             await this.ingestCommitsForPR(owner, repo, repoId, isPrivate, prNumber, prId, users);
           }
         }
@@ -669,34 +794,34 @@ export class GithubService {
       const comments = await this.retryWithBackoff(
         () => this.octokit.paginate(
           this.octokit.issues.listCommentsForRepo,
-          { owner, repo, per_page: 100, since: sinceIso },
-          (r) => r.data,
+          { owner, repo, per_page: 100, since: sinceIso } satisfies IssueCommentParams,
+          (r) => r.data as IssueCommentItem[],
         ),
         `Issue comments for ${owner}/${repo}`
       );
 
       for (const c of comments) {
-        const login = (c as any).user?.login;
+        const login = c.user?.login ?? null;
         if (users.size && login && !users.has(login)) continue;
 
         try {
           const parentId = await this.resolveIssueParentId(owner, repo, c, numberToId);
 
           const row: BronzeRow = {
-            event_ulid: `issue_comment:${(c as any).id}`,
+            event_ulid: `issue_comment:${String(c.id)}`,
             provider: 'github',
             event_type: 'issue_comment',
-            provider_event_id: String((c as any).id),
-            actor_user_node: (c as any).user?.id ? String((c as any).user.id) : null,
+            provider_event_id: String(c.id),
+            actor_user_node: c.user?.id != null ? String(c.user.id) : null,
             repo_node: repoId != null ? String(repoId) : null,
             target_node: parentId, // <-- Parent Issue/PR ID
-            created_at: (c as any).created_at ?? null,
+            created_at: c.created_at ?? null,
             is_private: isPrivate ?? null,
-            raw_payload: c,
+            raw_payload: c as RawPayload,
           };
           await this.writeEventBoth(row);
         } catch (error) {
-          this.logger.warn(`❌ Failed to ingest issue comment ${(c as any).id} for ${owner}/${repo}: ${error}`);
+          this.logger.warn(`❌ Failed to ingest issue comment ${c.id} for ${owner}/${repo}: ${error}`);
         }
       }
     } catch (error) {
@@ -713,29 +838,29 @@ export class GithubService {
       const comments = await this.retryWithBackoff(
         () => this.octokit.paginate(
           this.octokit.pulls.listReviewCommentsForRepo,
-          { owner, repo, per_page: 100, since: sinceIso },
-          (r) => r.data,
+          { owner, repo, per_page: 100, since: sinceIso } satisfies ReviewCommentParams,
+          (r) => r.data as ReviewCommentItem[],
         ),
         `PR review comments for ${owner}/${repo}`
       );
 
       for (const c of comments) {
-        const login = (c as any).user?.login;
+        const login = c.user?.login ?? null;
         if (users.size && login && !users.has(login)) continue;
 
         const parentId = await this.resolvePRParentId(owner, repo, c, numberToId);
 
         const row: BronzeRow = {
-          event_ulid: `pr_review_comment:${(c as any).id}`,
+          event_ulid: `pr_review_comment:${String(c.id)}`,
           provider: 'github',
           event_type: 'pr_review_comment',
-          provider_event_id: String((c as any).id),
-          actor_user_node: (c as any).user?.id ? String((c as any).user.id) : null,
+          provider_event_id: String(c.id),
+          actor_user_node: c.user?.id != null ? String(c.user.id) : null,
           repo_node: repoId != null ? String(repoId) : null,
           target_node: parentId, // <-- Parent PR ID
-          created_at: (c as any).created_at ?? null,
+          created_at: c.created_at ?? null,
           is_private: isPrivate ?? null,
-          raw_payload: c,
+          raw_payload: c as RawPayload,
         };
         await this.writeEventBoth(row);
       }
@@ -753,7 +878,7 @@ export class GithubService {
 
     for (const login of who) {
       try {
-        const params: any = { owner, repo, per_page: 100, since: sinceIso };
+        const params: RepoCommitParams = { owner, repo, per_page: 100, since: sinceIso };
         if (untilIso) params.until = untilIso;
         if (login) params.author = login;
 
@@ -761,7 +886,7 @@ export class GithubService {
           () => this.octokit.paginate(
             this.octokit.repos.listCommits,
             params,
-            (r) => r.data,
+            (r) => r.data as RepoCommitItem[],
           ),
           `Commits for ${owner}/${repo} ${login ? `(author: ${login})` : ''}`,
           5,
@@ -769,20 +894,20 @@ export class GithubService {
         );
 
         for (const c of commits) {
-          const authorLogin = (c as any).author?.login;
+          const authorLogin = c.author?.login ?? null;
           if (users.size && (!authorLogin || !users.has(authorLogin))) continue;
 
           const row: BronzeRow = {
-            event_ulid: `commit:${(c as any).sha}`, // optionally include repo id: `commit:${repoId}:${sha}`
+            event_ulid: `commit:${String(c.sha)}`, // optionally include repo id: `commit:${repoId}:${sha}`
             provider: 'github',
             event_type: 'commit',
-            provider_event_id: String((c as any).sha),
-            actor_user_node: (c as any).author?.id ? String((c as any).author.id) : null,
+            provider_event_id: String(c.sha),
+            actor_user_node: c.author?.id != null ? String(c.author.id) : null,
             repo_node: repoId != null ? String(repoId) : null,
             target_node: null, // no push linkage here (can be added via Events pipeline later)
-            created_at: (c as any).commit?.committer?.date ?? null,
+            created_at: c.commit?.committer?.date ?? null,
             is_private: isPrivate ?? null,
-            raw_payload: c,
+            raw_payload: c as RawPayload,
           };
           await this.writeEventBoth(row);
         }
@@ -795,6 +920,77 @@ export class GithubService {
   // =======================
   // orchestrator
   // =======================
+
+  /**
+   * Process ONLY the specified new users without including existing DB users
+   */
+  async ingestNewUsersOnly(
+    usersArray: string[],
+    sinceIso?: string,
+    untilIso?: string,
+  ) {
+    const inputUsers = new Set(usersArray.map((s) => s.trim()).filter(Boolean));
+    
+    if (!inputUsers.size) throw new Error('users list is required');
+
+    const until = untilIso ?? this.isoNow();
+    const since = sinceIso ?? this.isoDaysAgo(180); // 6 months for new users
+
+    this.logger.log(`🆕 Processing ONLY new users: ${Array.from(inputUsers).join(', ')}`);
+    
+    // Create time windows for input users only (all get 6 months as new users)
+    const userTimeWindows = new Map<string, string>();
+    for (const user of inputUsers) {
+      userTimeWindows.set(user, since);
+      this.logger.log(`📅 User ${user}: fetching last 180 days (new user)`);
+    }
+
+    await this.upsertUserProfilesToBronze([...inputUsers]);
+    const repoUsers = await this.buildRepoUsersMap(userTimeWindows);
+
+    // Fetch all repo metadata in parallel
+    const repoList = Array.from(repoUsers.values());
+    const repoMetaMap = await this.fetchMultipleReposMeta(
+      repoList.map(({owner, repo}) => ({owner, repo}))
+    );
+
+    // Track users we actually processed successfully
+    const touchedUsers = new Set<string>();
+    
+    let ingestedRepos = 0;
+    const totalRepos = Array.from(repoUsers.values()).length;
+    for (const { owner, repo, users: usersForRepo } of repoUsers.values()) {
+      this.logger.log(`🔄 Processing repo ${ingestedRepos + 1}/${totalRepos}: ${owner}/${repo}`);
+      const meta = repoMetaMap.get(this.repoKey(owner, repo));
+      if (!meta) {
+        this.logger.warn(`❌ No metadata found for ${owner}/${repo}, skipping`);
+        continue;
+      }
+
+      // Mark users as touched when we begin processing their repo
+      for (const user of usersForRepo) touchedUsers.add(user);
+
+      const numberToId = await this.buildNumberToIdMap(meta.owner, meta.name, since);
+      await this.ingestIssuesAndPRsByCreator(meta.owner, meta.name, meta.id, meta.private, usersForRepo, since);
+      await this.ingestIssueComments(meta.owner, meta.name, meta.id, meta.private, usersForRepo, since, numberToId);
+      await this.ingestPRReviewComments(meta.owner, meta.name, meta.id, meta.private, usersForRepo, since, numberToId);
+      await this.ingestCommitsForUsers(meta.owner, meta.name, meta.id, meta.private, usersForRepo, since, until);
+      ingestedRepos++;
+      this.logger.log(`✅ Completed repo ${ingestedRepos}/${totalRepos}: ${owner}/${repo}`);
+    }
+    
+    // Update last_synced_at only for users we actually touched
+    await this.updateUserSyncTimestamp([...touchedUsers], until);
+    
+    return { 
+      mode: 'new-users-only', 
+      users: [...inputUsers], 
+      excludedUsers: [], // No excluded users in this mode
+      repos: ingestedRepos, 
+      since, 
+      until
+    };
+  }
 
   /**
    *  - discover per-user repos since `sinceIso`
@@ -826,21 +1022,23 @@ export class GithubService {
     // Check which users exist in gold.user_profile (all users)
     const existingUsers = await this.checkUsersInGoldProfile([...allUsersToProcess]);
     
+    // Upsert user profiles first, then get sync dates
+    await this.upsertUserProfilesToBronze([...allUsersToProcess]);
+    const userSyncDates = await this.getUserSyncDates([...allUsersToProcess]);
+    
     // Create user-specific time windows for ALL users
     const userTimeWindows = new Map<string, string>();
     for (const user of allUsersToProcess) {
       if (existingUsers.has(user)) {
-        // Existing user: last 48 hours
-        userTimeWindows.set(user, sinceIso ?? this.isoHoursAgo(48));
-        this.logger.log(`📅 User ${user}: fetching last 2 days (existing user)`);
+        // Existing user: use sync date logic (last_synced_at - 1 day or latest activity)
+        const syncDate = userSyncDates.get(user) || this.isoHoursAgo(48);
+        userTimeWindows.set(user, syncDate);
       } else {
         // New user: last 6 months
         userTimeWindows.set(user, sinceIso ?? this.isoDaysAgo(180));
         this.logger.log(`📅 User ${user}: fetching last 180 days (new user)`);
       }
     }
-
-    await this.upsertUserProfilesToBronze([...allUsersToProcess]);
     const repoUsers = await this.buildRepoUsersMap(userTimeWindows);
 
     // Fetch all repo metadata in parallel
@@ -849,6 +1047,9 @@ export class GithubService {
       repoList.map(({owner, repo}) => ({owner, repo}))
     );
 
+    // Track users we actually processed successfully
+    const touchedUsers = new Set<string>();
+    
     let ingestedRepos = 0;
     const totalRepos = Array.from(repoUsers.values()).length;
     for (const { owner, repo, users: usersForRepo } of repoUsers.values()) {
@@ -865,6 +1066,9 @@ export class GithubService {
       ));
       const repoSinceIso = new Date(repoSince).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
+      // Mark users as touched when we begin processing their repo
+      for (const user of usersForRepo) touchedUsers.add(user);
+
       const numberToId = await this.buildNumberToIdMap(meta.owner, meta.name, repoSinceIso);
       await this.ingestIssuesAndPRsByCreator(meta.owner, meta.name, meta.id, meta.private, usersForRepo, repoSinceIso);
       await this.ingestIssueComments(meta.owner, meta.name, meta.id, meta.private, usersForRepo, repoSinceIso, numberToId);
@@ -873,6 +1077,9 @@ export class GithubService {
       ingestedRepos++;
       this.logger.log(`✅ Completed repo ${ingestedRepos}/${totalRepos}: ${owner}/${repo}`);
     }
+
+    // Update last_synced_at only for users we actually touched
+    await this.updateUserSyncTimestamp([...touchedUsers], until);
 
     // For backward compatibility, use the earliest time window as 'since'
     const earliestSince = Math.min(...Array.from(userTimeWindows.values()).map(iso => new Date(iso).getTime()));
